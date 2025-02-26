@@ -1,0 +1,9 @@
+data/THUMOS14
+
+*__pycache__*
+
+experiments/train
+experiments/test
+
+test_scripts.py
+TODO.md
