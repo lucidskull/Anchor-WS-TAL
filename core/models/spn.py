@@ -3,29 +3,11 @@ import torch.nn as nn
 
 from ..config import cfg
 
-class TemporalAnchorGen(nn.Module):
-    """ Generate anchors for temporal proposals
-    """
-    def __init__(self, receptive_fields=cfg.receptive_fields):
-        super().__init__()
-        self.receptive_fields = receptive_fields
-
-    def forward(self, features):
-        vid_len = features.shape[0]
-        anchors = []
-        for i in self.receptive_fields:
-            anchors_over_receptive_fields = []
-            for idx in vid_len:
-                anchor = [idx-i,idx+i, i]
-                anchors_over_receptive_fields.append(anchor)
-            anchors.append(anchors_over_receptive_fields)
-        return torch.Tensor(anchors)
-
 class TemporalSegmentProposalNetwork(nn.Module):
     """ Generator network for 1D temporal video segment proposals
 
-        Proposals assist bounding box generation for temporal 
-        action localization
+        Proposals contain highest and lowest scoring segments to
+        represent action and background respectively
     """
 
     def __init__(
@@ -76,21 +58,17 @@ class TemporalSegmentProposalNetwork(nn.Module):
         return net
     
     def gen_anchors(self, x, anchor_sizes):
-        # x: [batch size, video length, feature dimension]
+        # x: [batch, time, feature dimension]
         num_fields = len(anchor_sizes)
-        batch_size = x.shape[0]
-        vid_len = x.shape[1]
+        batch = x.shape[0]
+        time = x.shape[1]
 
         start_offset = (torch.ceil(anchor_sizes / 2) - 1).to(torch.int32)
         end_offset = torch.floor(anchor_sizes / 2).to(torch.int32)
 
-        # # padding size
-        # offset = torch.max(end_offset)
-        # padding = offset * 2
-
         anchors = torch.empty([
             num_fields,
-            vid_len,
+            time,
             2
             ],
             dtype=torch.int32
@@ -98,8 +76,8 @@ class TemporalSegmentProposalNetwork(nn.Module):
 
         # generate anchors considering offset
         for i in range(num_fields):
-            field_anchors = torch.arange(0,vid_len)
-            field_anchors = field_anchors.unsqueeze(-1).expand([vid_len, 2])
+            field_anchors = torch.arange(0,time)
+            field_anchors = field_anchors.unsqueeze(-1).expand([time, 2])
             field_anchors = torch.cat([
                 (field_anchors[:,0] - start_offset[i]).unsqueeze(-1),
                 (field_anchors[:,1] + end_offset[i]).unsqueeze(-1)
@@ -111,9 +89,9 @@ class TemporalSegmentProposalNetwork(nn.Module):
         # expand for entire batch
         anchors = anchors.cuda()
         anchors = anchors.expand([
-            batch_size,
+            batch,
             num_fields,
-            vid_len,
+            time,
             2
         ])
 
@@ -148,21 +126,19 @@ class TemporalSegmentProposalNetwork(nn.Module):
         for i, field_len in enumerate(anchor_sizes):
             start_idx = anchors[i,:,:,0] + padding  # Shape: [batch, time]
             # Create a range for each time step
-            # Actually we dont care here about the end timestep, we fully index it all. 
-            # we add 0 to max_field_length values to start index. 
-            time_offsets = torch.arange(field_len, device=logits.device).view(1, 1, -1)  # Shape: [1, 1, field_length]
+            time_offsets = torch.arange(field_len, device=logits.device).view(1, 1, -1)  # Shape: [1, 1, field length]
 
             # Compute the actual indices
-            temporal_indices = start_idx.unsqueeze(-1) + time_offsets  # Shape: [batch, time, field_length]
+            temporal_indices = start_idx.unsqueeze(-1) + time_offsets  # Shape: [batch, time, field length]
 
             expanded_indices = temporal_indices.unsqueeze(-1).expand(-1, -1, -1, feature_dim)
 
-            # Gather along the time dimension (dim=2)
+            # Gather along the time dimension
             anchored_data.insert(i, torch.gather(
                 padded_logits[i].unsqueeze(2).expand(-1, -1, field_len, -1),  # Expand data to match the indices shape
                 dim=1,  # Gather along time dimension
                 index=expanded_indices
-            ))  # Output shape: [batch, time, field_length, feature_dim]
+            ))  # anchored data: list of [batch, time, field length, feature dimension] for each receptive field
 
         return anchored_data
 
@@ -171,10 +147,10 @@ class TemporalSegmentProposalNetwork(nn.Module):
         """ keep k proposals with highest action confidence (action)
             and k proposals with lowest action confidence (background)
         """
-        # anchors: [number of receptive fields, batch size, video length, 2]
-        # scores: [number of receptive fields, batch size, video length, number of classes]
+        # anchors: [receptive fields, batch, time, 2]
+        # scores: [receptive fields, batch, time, classes]
         actioness = torch.sum(scores, dim=3)
-        # actioness: [number of receptive fields, batch size, video length, 1]
+        # actioness: [receptive fields, batch, time]
         
         # sort by actioness
         idx = torch.argsort(actioness, dim=2, descending=True)
@@ -211,7 +187,7 @@ class TemporalSegmentProposalNetwork(nn.Module):
         return filtered_anchors, filtered_context_anchors, filtered_scores
     
     def video_labels(self, scores):
-       # scores: [number of receptive fields, batch_size, 2*self.k, number of classes]
+       # scores: [receptive fields, batch, 2*self.k, classes]
         label = scores.permute(1,0,2,3)
         label = label.flatten(start_dim=1, end_dim=2)
         actioness = label.sum(dim=2)
@@ -230,16 +206,16 @@ class TemporalSegmentProposalNetwork(nn.Module):
         return label
 
     
-    def snippet_mining(self, logits, context_anchors, scores, k_easy, k_hard):
+    def segment_mining(self, logits, context_anchors, scores, k_easy, k_hard):
         """ k easy and hard segments for action and background respectively
 
-            segments are selected by confidence score only
+            segments are selected by confidence score
         """
-        # logits: [number of receptive fields, batch size, video length, feature dimension]
-        # anchors: [number of receptive fields, batch_size, 2*self.k, 2]
-        # scores: [number of receptive fields, batch_size, 2*self.k, number of classes]
+        # logits: [receptive fields, batch, time, feature dimension]
+        # anchors: [receptive fields, batch, 2*self.k, 2]
+        # scores: [receptive fields, batch, 2*self.k, classes]
         actioness = torch.sum(scores, dim=3)
-        # actioness: [number of receptive fields, batch size, 2*self.k, 1]
+        # actioness: [receptive fields, batch, 2*self.k]
 
         # sort based on actioness
         idx = torch.argsort(actioness, dim=2, descending=True)
@@ -275,42 +251,46 @@ class TemporalSegmentProposalNetwork(nn.Module):
     
 
     def forward(self, x):
-        # x: [batch size, video length, feature dimension]
+        # x: [batch, time, feature dimension]
         anchors = self.gen_anchors(x, self.receptive_fields)
         context_anchors = self.gen_anchors(x, self.receptive_fields * 2)
-        # anchors: [number of receptive fields, batch size, video length, 3]
+        # anchors: [receptive fields, batch, time, 2]
+        # context anchors include temporal context
+
         self.k = anchors.size(dim=2) // 4
 
         x = x.permute([0,2,1])
-        # x: [batch size, feature dimension, video length]
+        # x: [batch, feature dimension, time]
         
         # sizes
-        num_rec_fields = len(self.receptive_fields)
+        num_fields = len(self.receptive_fields)
         shape = x.shape
-        batch_size = shape[0]
+        batch = shape[0]
         feature_dim = shape[1]
         time = shape[2]
 
         # apply convnets
-        logits = torch.empty([num_rec_fields, batch_size, feature_dim, time]).cuda()
-        for i in range(num_rec_fields):
+        logits = torch.empty([num_fields, batch, feature_dim, time]).cuda()
+        for i in range(num_fields):
             logits_over_receptive_field = self.temp_conv_nets[i](x)
             logits[i] = logits_over_receptive_field
-        # logits: [number of receptive fields, batch size, feature dimension, video length]
+        # logits: [receptive fields, batch, feature dimension, time]
+
         logits = logits.permute([0,1,3,2])
-        # logits: [number of receptive fields, batch size, video length, feature dimension]
+        # logits: [receptive fields, batch, time, feature dimension]
 
         # scores
         scores = torch.empty([
-            num_rec_fields,
-            batch_size,
+            num_fields,
+            batch,
             time,
             self.num_classes
         ]).cuda()
-        # scores: [number of receptive fields, batch size, video length, number of classes]
+        # scores: [receptive fields, batch, time, classes]
         
         seg_list = self.extract_logits(logits, context_anchors, self.receptive_fields*2)
-        # seg_list: list of [batch size, time, context length, feature dimension]
+        # seg_list: list of [batch, time, context length, feature dimension] for each receptive field
+
         for i, rec_field_logits in enumerate(seg_list):
             rec_field_logits = rec_field_logits.flatten(start_dim=2).permute(0,2,1)
             rec_field_scores = self.classifiers[i](rec_field_logits).permute(0,2,1)
@@ -327,7 +307,7 @@ class TemporalSegmentProposalNetwork(nn.Module):
             k_easy = self.k // 8
             k_hard = self.k // 8
 
-            easy_act, easy_bac, hard_act, hard_bac = self.snippet_mining(
+            easy_act, easy_bac, hard_act, hard_bac = self.segment_mining(
                 logits,
                 context_anchors,
                 scores,

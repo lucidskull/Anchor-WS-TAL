@@ -17,10 +17,8 @@ class Config():
         self.NUM_SEGMENTS = 500
 
         # METADATA
-        self.feature_dim = 2048 # dim for rgb and flow features each
-        #self.receptive_fields = [1,2,3,4,5,6,8,11,16]
-        #self.receptive_fields = [1,3,5,8]
-        self.receptive_fields = [1,2,3] # test
+        self.feature_dim = 2048
+        self.receptive_fields = [1,3,5,8]
         self.NUM_CLASSES = 20
         self.classes = {
             'BaseballPitch': 0,
@@ -47,7 +45,7 @@ class Config():
         # TRAIN
         self.NUM_ITERS = 6000
         self.TEST_FREQ = 100
-        self.LR_SPN = '[0.0001]*6000'
+        self.LR_SPN = '[0.00001]*6000'
         self.LR_SOI = '[0.0001]*6000'
 
         # EVAL

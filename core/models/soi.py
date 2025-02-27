@@ -1,6 +1,3 @@
-from typing import Dict, List
-import math
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -30,6 +27,8 @@ class SoIPool(nn.Module):
             num_seg,
             out_size
         ).cuda()
+
+        # iterate over receptive fields
         for i, rec_logits in enumerate(logit_list):
             # rec_logits: [batch size, number of segments, segment length, feature dimension]
             rec_logits = rec_logits.flatten(start_dim=2)
@@ -56,6 +55,7 @@ class SoIPool(nn.Module):
         return logits
 
 class SCNNPredictor(nn.Module):
+    """ Predictor for class action scores """
     def __init__(self, in_channels, num_classes=len(cfg.classes)):
         super().__init__()
 
@@ -73,6 +73,7 @@ class SCNNPredictor(nn.Module):
     
 
 class SCNNHead(nn.Module):
+    """ Feature embedding module """
     def __init__(self, in_channels, representation_size):
         super().__init__()
         self.in_channels = in_channels
@@ -96,9 +97,7 @@ class SCNNHead(nn.Module):
 
 
 class TemporalSoINetwork(nn.Module):
-    """
-    
-    """
+    """ Classification network for temporal action localization """
     def __init__(self, in_channels, soi_len, num_classes=len(cfg.classes), receptive_fields=cfg.receptive_fields):
         super().__init__()
         self.num_classes = num_classes
@@ -120,7 +119,7 @@ class TemporalSoINetwork(nn.Module):
         self.dropout = nn.Dropout(p=0.5)
 
     def pad_logits(self, logits, offset):
-        # logits: [number of receptive fields, batch size, video length, feature dimension]
+        # logits: [receptive fields, batch, time, feature dimension]
         padding = torch.zeros([
             logits.shape[0],
             logits.shape[1],
@@ -128,7 +127,7 @@ class TemporalSoINetwork(nn.Module):
             logits.shape[3]
         ]).cuda()
         padded_logits = torch.cat([padding, logits, padding], dim=2)
-        # padded_logits: [number of receptive fields, batch size, offset+video length+offset, feature dimension]
+        # padded_logits: [receptive fields, batch, offset+time+offset, feature dimension]
         
         return padded_logits
     
@@ -146,21 +145,19 @@ class TemporalSoINetwork(nn.Module):
         for i, field_len in enumerate(anchor_sizes):
             start_idx = anchors[i,:,:,0] + padding  # Shape: [batch, time]
             # Create a range for each time step
-            # Actually we dont care here about the end timestep, we fully index it all. 
-            # we add 0 to max_field_length values to start index. 
-            time_offsets = torch.arange(field_len, device=logits.device).view(1, 1, -1)  # Shape: [1, 1, field_length]
+            time_offsets = torch.arange(field_len, device=logits.device).view(1, 1, -1)  # Shape: [1, 1, field length]
 
             # Compute the actual indices
-            temporal_indices = start_idx.unsqueeze(-1) + time_offsets  # Shape: [batch, time, field_length]
+            temporal_indices = start_idx.unsqueeze(-1) + time_offsets  # Shape: [batch, time, field length]
 
             expanded_indices = temporal_indices.unsqueeze(-1).expand(-1, -1, -1, feature_dim)
 
-            # Gather along the time dimension (dim=2)
+            # Gather along the time dimension
             anchored_data.insert(i, torch.gather(
                 padded_logits[i].unsqueeze(2).expand(-1, -1, field_len, -1),  # Expand data to match the indices shape
                 dim=1,  # Gather along time dimension
                 index=expanded_indices
-            ))  # Output shape: [batch, time, field_length, feature_dim]
+            ))  # anchored_data: list of [batch, time, field length, feature dimension] for each receptive field
         return anchored_data
 
     def preprocess(self, features, proposals):
@@ -178,6 +175,7 @@ class TemporalSoINetwork(nn.Module):
         cas = torch.zeros(batch, self.time, self.num_classes).cuda()
         counter = torch.zeros(batch, self.time).cuda()
 
+        # sum score of all contributing segments at each temporal location
         for i in range(num_fields):
             for j in range(batch):
                 for l in range(num_seg):
@@ -186,6 +184,7 @@ class TemporalSoINetwork(nn.Module):
                     end = segment[1]
                     cas[j,start:end] = cas[j,start:end].add(scores[i,j,l])
                     counter[j,start:end] = counter[j,start:end].add(1)
+        # average
         counter[counter == 0] = 1
         cas = cas / counter.unsqueeze(-1)
         actioness = cas.sum(dim=2)
@@ -193,6 +192,7 @@ class TemporalSoINetwork(nn.Module):
         return cas, actioness
 
     def video_labels(self, cas, k):
+        # video label based on top k contributing segments
         sorted_scores, _= cas.sort(descending=True, dim=1)
         topk_scores = sorted_scores[:, :k, :]
         video_scores = self.softmax(topk_scores.mean(1))
@@ -216,6 +216,7 @@ class TemporalSoINetwork(nn.Module):
         for i in range(batch):
             condition = loc[i].unsqueeze(1) == idx_topk[i]
             idx = condition.nonzero()[:,0]
+
             # fill randomly if not enough
             if idx.shape[0] < idx_topk.shape[1]:
                 idx = torch.cat([idx, torch.randint(0,loc.shape[1],[idx_topk.shape[1] - idx.shape[0]]).cuda()], 0)
@@ -228,7 +229,12 @@ class TemporalSoINetwork(nn.Module):
 
         return selected_embeddings
 
-    def easy_snippets_mining(self, actionness, anchors, embeddings, k_easy):
+    def easy_segment_mining(self, actionness, anchors, embeddings, k_easy):
+        """ k easy and hard segments for action and background respectively
+        
+            easy segments are selected by score, hard segments are selected 
+            from segments at temporal boundaries
+        """
         select_idx = torch.ones_like(actionness).cuda()
         select_idx = self.dropout(select_idx)
 
@@ -242,7 +248,7 @@ class TemporalSoINetwork(nn.Module):
 
         return easy_act, easy_bac
 
-    def hard_snippets_mining(self, actionness, anchors, embeddings, k_hard):
+    def hard_segment_mining(self, actionness, anchors, embeddings, k_hard):
         aness_np = actionness.cpu().detach().numpy()
         aness_median = np.median(aness_np, 1, keepdims=True)
         aness_bin = np.where(aness_np > aness_median, 1.0, 0.0)
@@ -254,7 +260,7 @@ class TemporalSoINetwork(nn.Module):
         aness_region_inner = actionness * idx_region_inner
         hard_act = self.select_topk_embeddings(aness_region_inner, anchors, embeddings, k_hard)
 
-        # erosion masks to identify hard background regions at boundaries
+        # dilation masks to identify hard background regions at boundaries
         dilation_m = ndimage.binary_dilation(aness_bin, structure=np.ones((1,self.m))).astype(aness_np.dtype)
         dilation_M = ndimage.binary_dilation(aness_bin, structure=np.ones((1,self.M))).astype(aness_np.dtype)
         idx_region_outer = actionness.new_tensor(dilation_M - dilation_m)
@@ -263,34 +269,39 @@ class TemporalSoINetwork(nn.Module):
 
         return hard_act, hard_bac
     
-    def snippet_mining(self, actioness, anchors, embeddings, k_easy, k_hard):
-        easy_act, easy_bac = self.easy_snippets_mining(actioness, anchors, embeddings, k_easy)
-        hard_act, hard_bac = self.hard_snippets_mining(actioness, anchors, embeddings, k_hard)
+    def segment_mining(self, actioness, anchors, embeddings, k_easy, k_hard):
+        easy_act, easy_bac = self.easy_segment_mining(actioness, anchors, embeddings, k_easy)
+        hard_act, hard_bac = self.hard_segment_mining(actioness, anchors, embeddings, k_hard)
         
         return easy_act, easy_bac, hard_act, hard_bac
 
     def forward(self, features, proposals, context_proposals):
         features = self.preprocess(features, context_proposals)
         features = self.soi_pool(features)
-        # features: [number of receptive fields, batch size, number of segments, representation size]
+        # features: [receptive fields, batch, segments, representation size]
+
         logits = self.embed(features)
-        # logits: [number of receptive fields, batch size, number of segments, new representation size]
+        # logits: [receptive fields, batch, segments, new representation size]
+
         scores = self.predictor(logits)
-        # scores: [number of receptive fields, batch size, number of segments, number of classes]
+        # scores: [receptive fields, batch, segments, classes]
+
         cas, actioness = self.gen_cas(proposals, scores)
 
-        # receptive field difference does not matter from this point, therefore treat all the same
+        # receptive field difference does not matter from this point, treat all the same
         logits = logits.permute(1,0,2,3).flatten(start_dim=1, end_dim=2)
         proposals = proposals.permute(1,0,2,3).flatten(start_dim=1, end_dim=2)
         scores = scores.permute(1,0,2,3).flatten(start_dim=1, end_dim=2)
-        # [batch size, all segments, x]
+        # [size, segments, ...]
+
         self.k_easy = logits.shape[1] // 5
         self.k_hard = logits.shape[1] // 10
 
         video_scores = self.video_labels(cas, self.k_easy)
 
+        contrast_pairs = None
         if self.training:
-            easy_act, easy_bac, hard_act, hard_bac = self.snippet_mining(
+            easy_act, easy_bac, hard_act, hard_bac = self.segment_mining(
                 actioness,
                 proposals,
                 logits,

@@ -340,16 +340,11 @@ def main():
     
     # TEST
     if cfg.MODE == 'test':
-        # _, _ = test(net, cfg, test_loader, test_info, 0, None, cfg.MODEL_FILE)
-        # utils.save_best_record_thumos(
-        #     test_info, 
-        #     os.path.join(cfg.OUTPUT_PATH, "best_results.txt")
-        # )
-        # print(utils.table_format(
-        #     test_info,
-        #     cfg.TIOU_THRESH,
-        #     '[Model] THUMOS\'14 Performance'
-        # ))
+        spn = init_utils.init_spn_model()
+        soi = init_utils.init_soi_model()
+        net = init_utils.init_model(spn, soi)
+        _,_ = test(net, cfg, test_loader, test_info, 0, None, cfg.MODEL_FILE)
+        # net, cfg, test_loader, test_info, 0, None, cfg.MODEL_FILE
         return
 
     # TRAIN
